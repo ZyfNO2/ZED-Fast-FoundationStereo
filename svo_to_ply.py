@@ -174,9 +174,14 @@ class FFSInference:
 
     @torch.no_grad()
     def infer(self, left_img: np.ndarray, right_img: np.ndarray,
-              scale: float = 0.5, valid_iters: int = 8) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+              scale: float = 0.5, valid_iters: int = 8,
+              min_depth: float = 0.5, max_depth: float = 15.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Returns: (disparity, depth, xyz_map_in_camera_coords)
+
+        Filtering: removes points outside min_depth..max_depth range to prevent
+        conical/radial artifacts caused by unreliable disparity at close range
+        (disparity too large) and far range (disparity too small / tiny quantisation error).
         """
         if scale != 1.0:
             left_img = cv2.resize(left_img, fx=scale, fy=scale, dsize=None)
@@ -198,13 +203,21 @@ class FFSInference:
         yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
         us_right = xx - disp
         invalid = us_right < 0
-        disp[invalid] = np.inf
 
         K_scaled = self.K.copy().astype(np.float32)
         K_scaled[:2] *= scale
-        depth = (K_scaled[0, 0] * self.baseline / disp).astype(np.float32)
+
+        d_near_th = int(K_scaled[0, 0] * self.baseline / min_depth)
+        d_far_th  = max(16, int(K_scaled[0, 0] * self.baseline / max_depth))
+
+        valid_disp_mask = (disp > d_far_th) & (disp < d_near_th)
+        combined_invalid = invalid | (~valid_disp_mask)
+        disp_clean = disp.copy()
+        disp_clean[combined_invalid] = np.inf
+
+        depth = (K_scaled[0, 0] * self.baseline / disp_clean).astype(np.float32)
         depth[depth < 0.05] = 0
-        depth[depth > self.cfg.get('zfar', 100)] = 0
+        depth[depth > max_depth] = 0
 
         xyz_map = depth2xyzmap(depth, K_scaled)
         return disp, depth, xyz_map
@@ -216,17 +229,26 @@ import yaml
 class PointCloudFuser:
     """Multi-frame point cloud fusion with pose transform"""
 
-    def __init__(self, voxel_size: float = 0.02, nb_neighbors: int = 20,
-                 std_ratio: float = 2.0):
+    def __init__(self, voxel_size: float = 0.02, nb_neighbors: int = 50,
+                 std_ratio: float = 1.5, sparse_bin_factor: float = 2.0,
+                 min_pts_per_bin: int = 3):
         self.voxel_size = voxel_size
         self.nb_neighbors = nb_neighbors
         self.std_ratio = std_ratio
+        self.sparse_bin_factor = sparse_bin_factor
+        self.min_pts_per_bin = min_pts_per_bin
         self.all_points = []
         self.all_colors = []
 
     def add_frame(self, xyz_map: np.ndarray, color_img: np.ndarray,
                   pose_4x4: np.ndarray, valid_depth_range: Tuple[float, float] = (0.1, 100.0)):
-        """Transform camera-frame points to world frame and accumulate"""
+        """Transform camera-frame points to world frame and accumulate
+
+        Coordinate systems:
+          depth2xyzmap produces OpenCV convention: X→right, Y↓down, Z→forward
+          ZED pose expects RIGHT_HANDED_Y_UP:      X→right, Y↑up,   Z→backward
+          Conversion: x'=x, y'=-y, z'=-z
+        """
         points = xyz_map.reshape(-1, 3)
         colors = color_img.reshape(-1, 3)
 
@@ -237,21 +259,44 @@ class PointCloudFuser:
         if len(points) == 0:
             return
 
+        cv2zed = np.array([[1, 0, 0, 0],
+                           [0, -1, 0, 0],
+                           [0, 0, -1, 0],
+                           [0, 0, 0, 1]], dtype=np.float64)
         ones = np.ones((len(points), 1), dtype=np.float64)
         pts_homo = np.hstack([points.astype(np.float64), ones])
-        pts_world = (pose_4x4.astype(np.float64) @ pts_homo.T).T[:, :3]
+        pts_zed = (cv2zed @ pts_homo.T).T
+        pts_world = (pose_4x4.astype(np.float64) @ pts_zed.T).T[:, :3]
+
+        if len(self.all_points) == 0:
+            logging.info(f"First frame pose:\n{pose_4x4}")
+            logging.info(f"First frame world bbox: "
+                        f"x=[{pts_world[:,0].min():.2f},{pts_world[:,0].max():.2f}] "
+                        f"y=[{pts_world[:,1].min():.2f},{pts_world[:,1].max():.2f}] "
+                        f"z=[{pts_world[:,2].min():.2f},{pts_world[:,2].max():.2f}]")
 
         self.all_points.append(pts_world)
         self.all_colors.append(colors)
 
     def process_and_save(self, output_path: str) -> o3d.geometry.PointCloud:
-        """Merge, downsample, denoise, save PLY"""
+        """Merge, sparse filter, downsample, denoise, save PLY"""
         if len(self.all_points) == 0:
             raise ValueError("No points to fuse")
 
         all_pts = np.vstack(self.all_points)
         all_clr = np.vstack(self.all_colors)
         logging.info(f"Fusing {len(all_pts)} raw points from {len(self.all_points)} frames")
+
+        bin_size = self.voxel_size * self.sparse_bin_factor
+        keys = ((all_pts[:, 0] / bin_size).astype(np.int64) |
+                (all_pts[:, 1] / bin_size).astype(np.int64) << 10 |
+                (all_pts[:, 2] / bin_size).astype(np.int64) << 20)
+        unique_keys, counts = np.unique(keys, return_counts=True)
+        valid_bins = set(unique_keys[counts >= self.min_pts_per_bin])
+        keep_mask = np.array([k in valid_bins for k in keys])
+        all_pts = all_pts[keep_mask]
+        all_clr = all_clr[keep_mask]
+        logging.info(f"Sparse filter: removed {(~keep_mask).sum()} noise points, kept {len(all_pts)}")
 
         pcd = toOpen3dCloud(all_pts, all_clr)
         orig_len = len(pcd.points)
@@ -291,10 +336,16 @@ Examples:
                        help='Refinement iterations (default: 8)')
     parser.add_argument('--frame_skip', type=int, default=5,
                        help='Frames to skip between processed frames (default: 5)')
-    parser.add_argument('--z_far', type=float, default=20.0,
-                       help='Max depth in meters (default: 20.0)')
+    parser.add_argument('--min_depth', type=float, default=0.5,
+                       help='Minimum valid depth in meters (default: 0.5)')
+    parser.add_argument('--max_depth', type=float, default=15.0,
+                       help='Maximum valid depth in meters (default: 15.0)')
     parser.add_argument('--voxel_size', type=float, default=0.02,
                        help='Voxel downsample size in meters (default: 0.02)')
+    parser.add_argument('--min_pts_per_bin', type=int, default=3,
+                       help='Min points per spatial bin for sparse filtering (default: 3)')
+    parser.add_argument('--sparse_bin_factor', type=float, default=2.0,
+                       help='Spatial bin size = voxel_size * this (default: 2.0)')
     args = parser.parse_args()
 
     set_logging_format()
@@ -323,21 +374,29 @@ Examples:
         return
 
     try:
-        with SVOReader(args.svo, z_far=args.z_far) as reader:
+        with SVOReader(args.svo, z_far=args.max_depth) as reader:
             ffs.K = reader.K
             ffs.baseline = reader.baseline
-            fuser = PointCloudFuser(voxel_size=args.voxel_size)
+            fuser = PointCloudFuser(
+                voxel_size=args.voxel_size,
+                nb_neighbors=50,
+                std_ratio=1.5,
+                min_pts_per_bin=args.min_pts_per_bin,
+                sparse_bin_factor=args.sparse_bin_factor,
+            )
 
             for idx, (left, right, pose) in enumerate(reader.stream_frames(frame_skip=args.frame_skip)):
                 t_frame = time.time()
                 disp, depth, xyz = ffs.infer(left, right, scale=args.scale,
-                                             valid_iters=args.valid_iters)
+                                             valid_iters=args.valid_iters,
+                                             min_depth=args.min_depth,
+                                             max_depth=args.max_depth)
                 if args.scale != 1.0:
                     left_scaled = cv2.resize(left, fx=args.scale, fy=args.scale, dsize=None)
                 else:
                     left_scaled = left
                 fuser.add_frame(xyz, left_scaled, pose,
-                                valid_depth_range=(0.1, args.z_far))
+                                valid_depth_range=(args.min_depth, args.max_depth))
                 dt = time.time() - t_frame
                 n_pts = (xyz.reshape(-1, 3)[:, 2] > 0.1).sum()
                 logging.info(f"Frame {idx}: {n_pts} pts, {dt:.2f}s")
