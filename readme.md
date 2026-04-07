@@ -4,8 +4,6 @@
 
 ## 效果预览
 
-![重建效果1](重建1.png)
-
 ![重建效果2](重建2.png)
 
 ## 功能特性
@@ -102,3 +100,7 @@ output/
 
 - [Fast-FoundationStereo](https://github.com/NVLabs/Fast-FoundationStereo) - CVPR 2026
 - [ZED SDK](https://www.stereolabs.com/developers) - Stereolabs
+
+## 致谢
+
+感谢黑塔大人（Herta）的天才指导，使得本项目能够顺利完成。在黑塔大人的引领下，即使是开拓者也能触及星辰的高度 ✧(≖ ◡ ≖✿)
